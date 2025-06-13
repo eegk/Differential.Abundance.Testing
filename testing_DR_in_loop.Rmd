@@ -1,0 +1,205 @@
+---
+title: "Differential Abundance Testing"
+author: "Edgar Gonzalez-Kozlova"
+date: "June 2025"
+output: 
+  html_document:
+  toc: true
+  toc_depth: 2
+  toc_float: true
+  ighlight: espresso
+number_sections: yes
+theme: cerulean
+---
+
+### Libraries
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE, results='hide'}
+list.of.packages <- c('crumblr',"variancePartition",'DirichletReg','limma','lqmm',
+                      'reshape','reshape2','pheatmap','tsne','ggplot2','mclust','grid','Rtsne','cccd',"BiostatsALL",'dplyr',
+                      'rmarkdown','rms','circlize',"swimplot",'ggrepel',"ggsci","clustree",'doParallel','ComplexHeatmap',
+                      'ComplexHeatmap',"ggpubr","factoextra","scales","tibble","RColorBrewer","ggdendro",'anndata','pals',
+                      "colorspace","Vennerable","cowplot","data.table","viridis","ggbeeswarm","tidyverse","dendextend")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages, repos=c("http://cran.rstudio.com/", "https://bioconductor.org/biocLite.R"))
+### if (!requireNamespace("BiocManager", quietly = TRUE)) ; install.packages("BiocManager") ; BiocManager::install("FlowSOM")
+lapply(list.of.packages, require, character.only = TRUE) ; rm(new.packages,list.of.packages)
+```
+
+### Set Seed
+
+Very important for reproducibility.
+
+```{r message=FALSE, warning=FALSE}
+set.seed(123)  # For reproducibility
+```
+
+### Make a List Object
+
+To store the results.
+
+```{r message=FALSE, warning=FALSE}
+thousand_exps <- list()
+```
+
+### For Loop 
+
+To run the fancy calculations for each method.
+
+```{r message=FALSE, warning=FALSE}
+for(iiii in 1:420){ # 420 times because this is the way.
+  n_samples <- 10   # Samples per condition
+  n_pops <- 12    # Number of cell populations
+  logFC_values <- c(0.1, 0.25, 0.5, 1)
+  logFC_range <- sort(rep(logFC_values, length.out = n_pops))
+  populations <- paste('pop',rep(1:n_pops),sep='')
+  control_data <- matrix(NA, nrow = n_samples, ncol = n_pops)
+  stim_data <- matrix(NA, nrow = n_samples, ncol = n_pops)
+  # Nested loop for sampling and controling the logFCs and variance
+  for (i in 1:n_pops) {
+    baseline_mean <- sample(10:1000, 1)
+    control_sd <- baseline_mean * 0.3
+    control_data[, i] <- rpois(n_samples, baseline_mean) + rnorm(n_samples, mean = 0, sd = control_sd)
+    stim_mean <- baseline_mean * 2^logFC_range[i]  # Adjust the mean based on logFC
+    stim_sd <- stim_mean * 0.3  # 30% standard deviation for variation
+    stim_data[, i] <- rpois(n_samples, stim_mean) + rnorm(n_samples, mean = 0, sd = stim_sd)
+    control_data[, i] <- pmax(0, control_data[, i])
+    stim_data[, i] <- pmax(0, stim_data[, i])
+  }
+  
+  # boring formatting 
+  
+  control_df <- as.data.frame(control_data)
+  stim_df <- as.data.frame(stim_data)
+  colnames(control_df) <- populations
+  colnames(stim_df) <- populations
+  control_df$Sample <- paste0("ctrl", 1:n_samples)
+  stim_df$Sample <- paste0("stim", 1:n_samples)
+  final_data <- bind_rows(
+    control_df %>% mutate(Condition = "Control"),
+    stim_df %>% mutate(Condition = "Stimulated")
+  )
+  
+  # snitches get stitches
+  
+  final_data <- final_data %>% select(Sample, Condition, everything())
+  simulated_data <- final_data
+  simulated_data$Condition<-NULL
+  rownames(simulated_data) <- simulated_data$Sample
+  simulated_data$Sample <- NULL
+  
+  ### formating using DR or crumblr
+  
+  cobj_count <- crumblr( simulated_data )
+  DR_count <- DR_data(simulated_data)
+  
+  info_sim <- data.frame(stim=rownames(simulated_data),StimStatus=rownames(simulated_data))
+  rownames(info_sim) <- rownames(simulated_data)
+  info_sim$StimStatus[grep('ctrl',info_sim$StimStatus)] <- 'ctrl'
+  info_sim$StimStatus[grep('stim',info_sim$StimStatus)] <- 'stim'
+  info_sim$ind <- info_sim$stim
+  info_sim$ind <- gsub('ctrl','',info_sim$ind)
+  info_sim$ind <- gsub('stim','',info_sim$ind)
+  
+  ### dream stats
+  
+  fit <- dream(cobj_count, ~ StimStatus + (1|ind), info_sim)
+  fit <- eBayes(fit)
+  crumblr_results_sim_V2 <- topTable(fit, coef = "StimStatusstim", number = Inf)
+  
+  ### lqmm stats
+  
+  lqmm_res <- list()
+  for(i in 1:nrow(cobj_count$E)){
+    df <- data.frame(
+      Proportion = cobj_count$E[i, ],
+      StimStatus = info_sim$StimStatus,
+      PID = info_sim$ind
+    )
+    
+    lqmm_fit_model <- lqmm(
+      fixed = Proportion ~ as.factor(StimStatus),
+      random = ~ 1,
+      group = PID,
+      data = df,
+      control = lqmmControl(LP_max_iter = 25000, LP_tol_ll = 1e-4, LP_tol_theta = 1e-4)
+    )
+    lqmm_summary <- summary(lqmm_fit_model, R = 100)
+    p_lqmm <- lqmm_summary$tTable["as.factor(StimStatus)stim", "Pr(>|t|)"]
+    beta_lqmm <- lqmm_summary$tTable["as.factor(StimStatus)stim", "Value"]
+    
+    lqmm_res[[i]] <- data.frame(pop=rownames(cobj_count$E)[i],p=p_lqmm,beta=beta_lqmm)
+  }
+  lqmm_res <- do.call(rbind,lqmm_res)
+  
+  ### DR hypothesis testing
+  
+  dr_fit_common <- DirichReg( DR_count ~ StimStatus, info_sim, model = "common") #control = list(iterlim = 2000)
+  u = summary(dr_fit_common)
+  pvals = round(u$coef.mat[grep('StimStatusstim', rownames(u$coef.mat), invert=FALSE), 4],8)
+  v = names(pvals)
+  prob.ratio = exp( summary(dr_fit_common)$coefficients[paste0(colnames(DR_count),":StimStatusstim")] )
+  pvals = round(matrix(pvals, ncol=length(u$varnames)),8)
+  rownames(pvals) = gsub('StimStatusstim', '', v[1:nrow(pvals)])
+  colnames(pvals) = u$varnames
+  dr_res <- data.frame(log2fc = log2(exp( summary(dr_fit_common)$coefficients[paste0(colnames(DR_count),":StimStatusstim")] )),
+                       coef =  summary(dr_fit_common)$coefficients[paste0(colnames(DR_count),":StimStatusstim")], 
+                       pval=colMeans(pvals))
+  rownames(dr_res) <- gsub(':StimStatusstim','',rownames(dr_res))
+  dr_res$prob.ratio <- prob.ratio
+  dr_res$fdr <- p.adjust(dr_res$pval,method = 'BH')
+  dr_results_sim_V2 <- dr_res
+  
+  # formatting
+  
+  x <- DR_count[,]
+  x <- as.data.frame(x)
+  my_pval <- list()
+  for(i in 1:12){
+    y <- wilcox.test(x=x[1:10,i],y=x[11:20,i])
+    my_pval[[i]]<- y$p.value
+  }
+  y <- data.frame(Marker= colnames(x),pval=unlist(my_pval))
+  wilcoxon_test <- y
+  
+  dr_results_sim_V2$Marker <- rownames(dr_results_sim_V2)
+  dr_results_sim_V2$Marker <- factor(dr_results_sim_V2$Marker,levels = dr_results_sim_V2$Marker)
+  crumblr_results_sim_V2$Marker <- rownames(crumblr_results_sim_V2)
+  crumblr_results_sim_V2$Marker <- factor(crumblr_results_sim_V2$Marker,levels = levels(dr_results_sim_V2$Marker))
+  crumblr_results_sim_V2 <- crumblr_results_sim_V2[order(crumblr_results_sim_V2$Marker),]
+  
+  sumres <- data.frame(
+    w_pval=wilcoxon_test$pval,
+    Marker=wilcoxon_test$Marker,
+    dr_pval=dr_results_sim_V2$pval,
+    dr_fc=dr_results_sim_V2$log2fc,
+    crumblr_pval=crumblr_results_sim_V2$P.Value,
+    crumblr_fc=crumblr_results_sim_V2$logFC,
+    lqmm_pval=lqmm_res$p,
+    lqmm_fc=lqmm_res$beta,
+    real=logFC_range
+  )
+  
+  thousand_exps[[iiii]] <- sumres
+}
+
+thousand_exps_flat <- do.call(rbind,thousand_exps)
+```
+
+### Compare real LogFCs to Estimations from DR
+
+```{r message=FALSE, warning=FALSE}
+summary(lm(thousand_exps_flat$real ~ thousand_exps_flat$dr_fc))
+```
+
+### Compare real LogFCs to Estimations from crumblr/Dream
+
+```{r message=FALSE, warning=FALSE}
+summary(lm(thousand_exps_flat$real ~ thousand_exps_flat$crumblr_fc))
+```
+
+### Compare real LogFCs to Estimations from LQMM
+
+```{r message=FALSE, warning=FALSE}
+summary(lm(thousand_exps_flat$real ~ thousand_exps_flat$lqmm_fc))
+```
